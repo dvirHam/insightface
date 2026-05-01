@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -96,6 +97,37 @@ def load_known_gallery(app: FaceAnalysis, known_dir: str) -> tuple[np.ndarray, L
     return np.stack(embeddings, axis=0), names
 
 
+def ensure_unlabeled_dir(known_dir: str) -> Path:
+    unlabeled = Path(known_dir) / "_unlabeled"
+    unlabeled.mkdir(parents=True, exist_ok=True)
+    return unlabeled
+
+
+def is_new_face(embedding: np.ndarray, seen_embeddings: List[np.ndarray], threshold: float) -> bool:
+    if not seen_embeddings:
+        return True
+    sims = np.array([float(np.dot(embedding, seen)) for seen in seen_embeddings], dtype=np.float32)
+    return float(np.max(sims)) < threshold
+
+
+def save_face_crop(frame: np.ndarray, bbox: np.ndarray, target_dir: Path) -> Path | None:
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox.astype(int)
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = target_dir / f"face_{stamp}.jpg"
+    cv2.imwrite(str(path), crop)
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Real-time InsightFace using laptop/external cameras."
@@ -137,6 +169,12 @@ def main() -> None:
         default=0.35,
         help="Cosine similarity threshold to assign a known name.",
     )
+    parser.add_argument(
+        "--new-face-threshold",
+        type=float,
+        default=0.50,
+        help="Cosine similarity threshold for deciding if a face is new/unseen.",
+    )
     args = parser.parse_args()
 
     available = find_available_cameras(args.max_cam_id, args.backend)
@@ -145,7 +183,10 @@ def main() -> None:
     app = FaceAnalysis(providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
     app.prepare(ctx_id=args.ctx_id, det_size=(args.det_size, args.det_size))
     gallery_embeds, gallery_names = load_known_gallery(app, args.known_dir)
+    unlabeled_dir = ensure_unlabeled_dir(args.known_dir)
+    seen_embeddings: List[np.ndarray] = []
     print(f"Known identities loaded: {len(gallery_names)}")
+    print(f"Unlabeled captures folder: {unlabeled_dir}")
 
     cam_id = args.cam_id
     cap, backend_name = open_camera_with_fallback(
@@ -170,8 +211,8 @@ def main() -> None:
         for face in faces:
             x1, y1, x2, y2 = face.bbox.astype(int)
             label = "Unknown"
+            emb = face.normed_embedding.astype(np.float32)
             if gallery_embeds.shape[0] > 0:
-                emb = face.normed_embedding.astype(np.float32)
                 sims = gallery_embeds @ emb
                 best_idx = int(np.argmax(sims))
                 best_sim = float(sims[best_idx])
@@ -179,6 +220,11 @@ def main() -> None:
                     label = f"{gallery_names[best_idx]} ({best_sim:.2f})"
                 else:
                     label = f"Unknown ({best_sim:.2f})"
+            if is_new_face(emb, seen_embeddings, args.new_face_threshold):
+                saved_path = save_face_crop(frame, face.bbox, unlabeled_dir)
+                if saved_path is not None:
+                    print(f"New face captured: {saved_path}")
+                    seen_embeddings.append(emb)
             cv2.rectangle(output, (x1, y1), (x2, y2), (0, 200, 255), 2)
             cv2.putText(
                 output,
