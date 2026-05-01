@@ -1,7 +1,7 @@
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -103,14 +103,9 @@ def ensure_unlabeled_dir(known_dir: str) -> Path:
     return unlabeled
 
 
-def is_new_face(embedding: np.ndarray, seen_embeddings: List[np.ndarray], threshold: float) -> bool:
-    if not seen_embeddings:
-        return True
-    sims = np.array([float(np.dot(embedding, seen)) for seen in seen_embeddings], dtype=np.float32)
-    return float(np.max(sims)) < threshold
-
-
-def save_face_crop(frame: np.ndarray, bbox: np.ndarray, target_dir: Path) -> Path | None:
+def save_face_crop(
+    frame: np.ndarray, bbox: np.ndarray, target_dir: Path, prefix: str = "face"
+) -> Path | None:
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = bbox.astype(int)
     x1 = max(0, x1)
@@ -123,9 +118,60 @@ def save_face_crop(frame: np.ndarray, bbox: np.ndarray, target_dir: Path) -> Pat
     if crop.size == 0:
         return None
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = target_dir / f"face_{stamp}.jpg"
+    path = target_dir / f"{prefix}_{stamp}.jpg"
     cv2.imwrite(str(path), crop)
     return path
+
+
+def estimate_yaw(face) -> float:
+    pose = getattr(face, "pose", None)
+    if pose is not None and len(pose) >= 2:
+        return float(pose[1])
+    kps = getattr(face, "kps", None)
+    if kps is None or len(kps) < 3:
+        return 0.0
+    left_eye = kps[0].astype(np.float32)
+    right_eye = kps[1].astype(np.float32)
+    nose = kps[2].astype(np.float32)
+    dl = float(np.linalg.norm(nose - left_eye))
+    dr = float(np.linalg.norm(nose - right_eye))
+    if dl + dr < 1e-6:
+        return 0.0
+    return ((dr - dl) / (dr + dl)) * 45.0
+
+
+def image_sharpness(frame: np.ndarray, bbox: np.ndarray) -> float:
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox.astype(int)
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    crop = frame[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def face_quality_score(frame: np.ndarray, face, yaw: float) -> float:
+    area = _face_area(face)
+    sharp = image_sharpness(frame, face.bbox)
+    frontal_bonus = max(0.0, 1.0 - abs(yaw) / 45.0)
+    return (area / 10000.0) + (sharp / 200.0) + frontal_bonus
+
+
+def find_cluster_index(
+    embedding: np.ndarray, clusters: List[Dict[str, object]], threshold: float
+) -> int | None:
+    if not clusters:
+        return None
+    reps = np.stack([c["rep"] for c in clusters], axis=0)
+    sims = reps @ embedding
+    best_idx = int(np.argmax(sims))
+    if float(sims[best_idx]) >= threshold:
+        return best_idx
+    return None
 
 
 def main() -> None:
@@ -175,6 +221,18 @@ def main() -> None:
         default=0.50,
         help="Cosine similarity threshold for deciding if a face is new/unseen.",
     )
+    parser.add_argument(
+        "--front-yaw-max",
+        type=float,
+        default=15.0,
+        help="Absolute yaw <= this is considered front face.",
+    )
+    parser.add_argument(
+        "--side-yaw-min",
+        type=float,
+        default=25.0,
+        help="Absolute yaw >= this is considered side face.",
+    )
     args = parser.parse_args()
 
     available = find_available_cameras(args.max_cam_id, args.backend)
@@ -184,7 +242,7 @@ def main() -> None:
     app.prepare(ctx_id=args.ctx_id, det_size=(args.det_size, args.det_size))
     gallery_embeds, gallery_names = load_known_gallery(app, args.known_dir)
     unlabeled_dir = ensure_unlabeled_dir(args.known_dir)
-    seen_embeddings: List[np.ndarray] = []
+    unknown_clusters: List[Dict[str, object]] = []
     print(f"Known identities loaded: {len(gallery_names)}")
     print(f"Unlabeled captures folder: {unlabeled_dir}")
 
@@ -212,23 +270,72 @@ def main() -> None:
             x1, y1, x2, y2 = face.bbox.astype(int)
             label = "Unknown"
             emb = face.normed_embedding.astype(np.float32)
+            yaw = estimate_yaw(face)
+            is_known = False
             if gallery_embeds.shape[0] > 0:
                 sims = gallery_embeds @ emb
                 best_idx = int(np.argmax(sims))
                 best_sim = float(sims[best_idx])
                 if best_sim >= args.match_threshold:
                     label = f"{gallery_names[best_idx]} ({best_sim:.2f})"
+                    is_known = True
                 else:
                     label = f"Unknown ({best_sim:.2f})"
-            if is_new_face(emb, seen_embeddings, args.new_face_threshold):
-                saved_path = save_face_crop(frame, face.bbox, unlabeled_dir)
-                if saved_path is not None:
-                    print(f"New face captured: {saved_path}")
-                    seen_embeddings.append(emb)
+
+            if not is_known:
+                cluster_idx = find_cluster_index(
+                    emb, unknown_clusters, args.new_face_threshold
+                )
+                if cluster_idx is None:
+                    cluster_id = len(unknown_clusters)
+                    saved_path = save_face_crop(
+                        frame, face.bbox, unlabeled_dir, prefix=f"unknown_{cluster_id}_first"
+                    )
+                    unknown_clusters.append(
+                        {
+                            "rep": emb.copy(),
+                            "front_score": -1.0,
+                            "side_score": -1.0,
+                            "front_path": None,
+                            "side_path": None,
+                        }
+                    )
+                    if saved_path is not None:
+                        print(f"New face captured (first): {saved_path}")
+                else:
+                    cluster = unknown_clusters[cluster_idx]
+                    # Slowly update representative embedding for stable clustering.
+                    cluster["rep"] = (
+                        0.9 * cluster["rep"] + 0.1 * emb
+                    ) / (np.linalg.norm(0.9 * cluster["rep"] + 0.1 * emb) + 1e-12)
+                    score = face_quality_score(frame, face, yaw)
+                    abs_yaw = abs(yaw)
+                    if abs_yaw <= args.front_yaw_max and score > float(cluster["front_score"]):
+                        saved_path = save_face_crop(
+                            frame,
+                            face.bbox,
+                            unlabeled_dir,
+                            prefix=f"unknown_{cluster_idx}_front",
+                        )
+                        if saved_path is not None:
+                            cluster["front_score"] = score
+                            cluster["front_path"] = str(saved_path)
+                            print(f"Better front face saved: {saved_path}")
+                    if abs_yaw >= args.side_yaw_min and score > float(cluster["side_score"]):
+                        saved_path = save_face_crop(
+                            frame,
+                            face.bbox,
+                            unlabeled_dir,
+                            prefix=f"unknown_{cluster_idx}_side",
+                        )
+                        if saved_path is not None:
+                            cluster["side_score"] = score
+                            cluster["side_path"] = str(saved_path)
+                            print(f"Better side face saved: {saved_path}")
             cv2.rectangle(output, (x1, y1), (x2, y2), (0, 200, 255), 2)
             cv2.putText(
                 output,
-                label,
+                f"{label} | yaw:{yaw:.1f}",
                 (x1, max(20, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
