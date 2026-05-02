@@ -149,24 +149,49 @@ def main():
             img, image_path.name, idx, len(images), group_key=group_key, group_size=len(group_images)
         )
         cv2.imshow("Manage Face Captures", show)
-        key = cv2.waitKey(0) & 0xFF
+        key = cv2.waitKeyEx(0)
+        key_low = key & 0xFF
 
-        if key == ord("q"):
+        if key_low in (ord("q"), ord("Q")):
             break
-        if key == ord("s"):
+        if key_low in (ord("s"), ord("S")):
             idx += 1
             continue
-        if key == ord("d"):
+        if key_low in (ord("d"), ord("D")):
             image_path.unlink(missing_ok=True)
             print(f"Deleted: {image_path.name}")
             continue
-        if key == ord("x"):
+        if key_low in (ord("x"), ord("X")):
             delete_group(group_images)
             continue
-        if key == ord("a"):
+        if key_low in (ord("a"), ord("A")):
             assign_image(image_path, known_dir)
             continue
-        if key == ord("g"):
+        if key_low in (ord("g"), ord("G")):
+            assign_group(group_images, known_dir)
+            continue
+        print(
+            f"Key not recognized (code={key}). "
+            "Type command in terminal: [a] assign one, [g] assign group, "
+            "[d] delete one, [x] delete group, [s] skip, [q] quit."
+        )
+        cmd = input("Command: ").strip().lower()
+        if cmd == "q":
+            break
+        if cmd == "s":
+            idx += 1
+            continue
+        if cmd == "d":
+            image_path.unlink(missing_ok=True)
+            print(f"Deleted: {image_path.name}")
+            continue
+        if cmd == "x":
+            delete_group(group_images)
+            continue
+        if cmd == "a":
+            assign_image(image_path, known_dir)
+            continue
+        if cmd == "g":
             assign_group(group_images, known_dir)
             continue
 

@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Dict, List
 
 import cv2
@@ -66,6 +67,9 @@ def load_known_gallery(app: FaceAnalysis, known_dir: str) -> tuple[np.ndarray, L
     image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
     for person_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if person_dir.name.startswith("_"):
+            # Skip technical directories like _unlabeled.
+            continue
         person_embeds = []
         for image_path in sorted(person_dir.iterdir()):
             if image_path.suffix.lower() not in image_exts:
@@ -174,6 +178,21 @@ def find_cluster_index(
     return None
 
 
+def should_save_better_shot(
+    current_score: float,
+    best_score: float,
+    now_ts: float,
+    last_save_ts: float,
+    min_improve: float,
+    min_interval_sec: float,
+) -> bool:
+    if current_score < (best_score + min_improve):
+        return False
+    if now_ts - last_save_ts < min_interval_sec:
+        return False
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Real-time InsightFace using laptop/external cameras."
@@ -233,6 +252,18 @@ def main() -> None:
         default=25.0,
         help="Absolute yaw >= this is considered side face.",
     )
+    parser.add_argument(
+        "--min-score-improve",
+        type=float,
+        default=0.25,
+        help="Save only if quality score improves by at least this amount.",
+    )
+    parser.add_argument(
+        "--min-save-interval-sec",
+        type=float,
+        default=2.5,
+        help="Minimum seconds between saves for same identity/angle.",
+    )
     args = parser.parse_args()
 
     available = find_available_cameras(args.max_cam_id, args.backend)
@@ -256,7 +287,7 @@ def main() -> None:
             "Try --cam-id 1 (or 2), and check Windows Camera privacy settings."
         )
     print(f"Using camera index: {cam_id} (backend: {backend_name})")
-    print("Controls: [n]=next camera, [p]=previous camera, [q]=quit")
+    print("Controls: [n]=next camera, [p]=previous camera, [r]=reload known faces, [q]=quit")
 
     while True:
         ok, frame = cap.read()
@@ -296,6 +327,8 @@ def main() -> None:
                             "rep": emb.copy(),
                             "front_score": -1.0,
                             "side_score": -1.0,
+                            "front_saved_ts": 0.0,
+                            "side_saved_ts": 0.0,
                             "front_path": None,
                             "side_path": None,
                         }
@@ -310,7 +343,15 @@ def main() -> None:
                     ) / (np.linalg.norm(0.9 * cluster["rep"] + 0.1 * emb) + 1e-12)
                     score = face_quality_score(frame, face, yaw)
                     abs_yaw = abs(yaw)
-                    if abs_yaw <= args.front_yaw_max and score > float(cluster["front_score"]):
+                    now_ts = time.time()
+                    if abs_yaw <= args.front_yaw_max and should_save_better_shot(
+                        score,
+                        float(cluster["front_score"]),
+                        now_ts,
+                        float(cluster["front_saved_ts"]),
+                        args.min_score_improve,
+                        args.min_save_interval_sec,
+                    ):
                         saved_path = save_face_crop(
                             frame,
                             face.bbox,
@@ -319,9 +360,17 @@ def main() -> None:
                         )
                         if saved_path is not None:
                             cluster["front_score"] = score
+                            cluster["front_saved_ts"] = now_ts
                             cluster["front_path"] = str(saved_path)
                             print(f"Better front face saved: {saved_path}")
-                    if abs_yaw >= args.side_yaw_min and score > float(cluster["side_score"]):
+                    if abs_yaw >= args.side_yaw_min and should_save_better_shot(
+                        score,
+                        float(cluster["side_score"]),
+                        now_ts,
+                        float(cluster["side_saved_ts"]),
+                        args.min_score_improve,
+                        args.min_save_interval_sec,
+                    ):
                         saved_path = save_face_crop(
                             frame,
                             face.bbox,
@@ -330,6 +379,7 @@ def main() -> None:
                         )
                         if saved_path is not None:
                             cluster["side_score"] = score
+                            cluster["side_saved_ts"] = now_ts
                             cluster["side_path"] = str(saved_path)
                             print(f"Better side face saved: {saved_path}")
             cv2.rectangle(output, (x1, y1), (x2, y2), (0, 200, 255), 2)
@@ -358,6 +408,10 @@ def main() -> None:
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord("r"):
+            gallery_embeds, gallery_names = load_known_gallery(app, args.known_dir)
+            print(f"Reloaded known identities: {len(gallery_names)}")
+            continue
         if key in (ord("n"), ord("p")):
             next_id = cam_id + 1 if key == ord("n") else cam_id - 1
             if next_id < 0:
